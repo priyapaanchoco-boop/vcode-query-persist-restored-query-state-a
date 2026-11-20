@@ -214,16 +214,18 @@ describe('createPersister', () => {
       }),
     )
 
-    await persister.persisterFn(queryFn, context, query)
+    // Restored timestamps travel in the marker for query.fetch to apply as-is,
+    // instead of raw data plus a callback patch.
+    const restored: any = await persister.persisterFn(queryFn, context, query)
     query.state.data = 'data0'
     query.fetch = vi.fn()
-    expect(query.state.dataUpdatedAt).toEqual(0)
 
     await vi.advanceTimersByTimeAsync(0)
 
     expect(queryFn).toHaveBeenCalledTimes(0)
     expect(query.fetch).toHaveBeenCalledTimes(0)
-    expect(query.state.dataUpdatedAt).toEqual(dataUpdatedAt)
+    expect(restored.data).toEqual('')
+    expect(restored.state.dataUpdatedAt).toEqual(dataUpdatedAt)
   })
 
   test('should restore item from the storage and refetch when `stale`', async () => {

@@ -1,4 +1,5 @@
 import {
+  createResult,
   hashKey,
   matchQuery,
   notifyManager,
@@ -107,8 +108,12 @@ export function experimental_createQueryPersister<TStorageValue = string>({
   filters,
 }: StoragePersisterOptions<TStorageValue>) {
   function isExpiredOrBusted(persistedQuery: PersistedQuery) {
-    if (persistedQuery.state.dataUpdatedAt) {
-      const queryAge = Date.now() - persistedQuery.state.dataUpdatedAt
+    const updatedAt = Math.max(
+      persistedQuery.state.dataUpdatedAt ?? 0,
+      persistedQuery.state.errorUpdatedAt ?? 0,
+    )
+    if (updatedAt) {
+      const queryAge = Date.now() - updatedAt
       const expired = queryAge > maxAge
       const busted = persistedQuery.buster !== buster
 
@@ -122,10 +127,9 @@ export function experimental_createQueryPersister<TStorageValue = string>({
     return true
   }
 
-  async function retrieveQuery<T>(
+  async function getPersistedQuery(
     queryHash: string,
-    afterRestoreMacroTask?: (persistedQuery: PersistedQuery) => void,
-  ) {
+  ): Promise<PersistedQuery | undefined> {
     if (storage != null) {
       const storageKey = `${prefix}-${queryHash}`
       try {
@@ -142,14 +146,7 @@ export function experimental_createQueryPersister<TStorageValue = string>({
           if (isExpiredOrBusted(persistedQuery)) {
             await storage.removeItem(storageKey)
           } else {
-            if (afterRestoreMacroTask) {
-              // Just after restoring we want to get fresh data from the server if it's stale
-              notifyManager.schedule(() =>
-                afterRestoreMacroTask(persistedQuery),
-              )
-            }
-            // We must resolve the promise here, as otherwise we will have `loading` state in the app until `queryFn` resolves
-            return persistedQuery.state.data as T
+            return persistedQuery
           }
         }
       } catch (err) {
@@ -161,6 +158,23 @@ export function experimental_createQueryPersister<TStorageValue = string>({
         }
         await storage.removeItem(storageKey)
       }
+    }
+
+    return
+  }
+
+  async function retrieveQuery<T>(
+    queryHash: string,
+    afterRestoreMacroTask?: (persistedQuery: PersistedQuery) => void,
+  ) {
+    const persistedQuery = await getPersistedQuery(queryHash)
+    if (persistedQuery) {
+      if (afterRestoreMacroTask) {
+        // Just after restoring we want to get fresh data from the server if it's stale
+        notifyManager.schedule(() => afterRestoreMacroTask(persistedQuery))
+      }
+      // We must resolve the promise here, as otherwise we will have `loading` state in the app until `queryFn` resolves
+      return persistedQuery.state.data as T
     }
 
     return
@@ -209,26 +223,24 @@ export function experimental_createQueryPersister<TStorageValue = string>({
 
     // Try to restore only if we do not have any data in the cache and we have persister defined
     if (matchesFilter && query.state.data === undefined && storage != null) {
-      const restoredData = await retrieveQuery(
-        query.queryHash,
-        (persistedQuery: PersistedQuery) => {
-          // Set proper updatedAt, since resolving in the first pass overrides those values
-          query.setState({
-            dataUpdatedAt: persistedQuery.state.dataUpdatedAt,
-            errorUpdatedAt: persistedQuery.state.errorUpdatedAt,
-          })
+      const persistedQuery = await getPersistedQuery(query.queryHash)
 
+      if (persistedQuery) {
+        // Just after restoring we want to get fresh data from the server if it's stale
+        notifyManager.schedule(() => {
           if (
             refetchOnRestore === 'always' ||
             (refetchOnRestore === true && query.isStale())
           ) {
             query.fetch()
           }
-        },
-      )
+        })
 
-      if (restoredData !== undefined) {
-        return Promise.resolve(restoredData as T)
+        // We must resolve the promise here, as otherwise we will have `loading` state in the app until `queryFn` resolves
+        return createResult({
+          data: persistedQuery.state.data as T,
+          state: persistedQuery.state as QueryState<T, any>,
+        })
       }
     }
 
@@ -270,6 +282,80 @@ export function experimental_createQueryPersister<TStorageValue = string>({
     }
   }
 
+  function mergeRestoredState(
+    persistedState: QueryState,
+    inMemoryState: QueryState,
+  ): QueryState | undefined {
+    const persistedDataUpdatedAt = persistedState.dataUpdatedAt ?? 0
+    const inMemoryDataUpdatedAt = inMemoryState.dataUpdatedAt ?? 0
+    const persistedErrorUpdatedAt = persistedState.errorUpdatedAt ?? 0
+    const inMemoryErrorUpdatedAt = inMemoryState.errorUpdatedAt ?? 0
+
+    const dataNewer = persistedDataUpdatedAt > inMemoryDataUpdatedAt
+    const errorNewer = persistedErrorUpdatedAt > inMemoryErrorUpdatedAt
+
+    if (!dataNewer && !errorNewer) {
+      return undefined
+    }
+
+    const dataSource = dataNewer ? persistedState : inMemoryState
+    const errorSource = errorNewer ? persistedState : inMemoryState
+
+    const mergedData = dataSource.data
+    const mergedDataUpdateCount =
+      dataSource.dataUpdateCount ?? inMemoryState.dataUpdateCount
+    const mergedDataUpdatedAt = dataNewer
+      ? persistedDataUpdatedAt
+      : inMemoryDataUpdatedAt
+
+    const mergedError =
+      errorSource.error !== undefined ? errorSource.error : inMemoryState.error
+    const mergedErrorUpdateCount =
+      errorSource.errorUpdateCount ?? inMemoryState.errorUpdateCount
+    const mergedErrorUpdatedAt = errorNewer
+      ? persistedErrorUpdatedAt
+      : inMemoryErrorUpdatedAt
+
+    const hasData = mergedData !== undefined
+    const hasError = mergedError !== null && mergedError !== undefined
+    let status: QueryState['status']
+    if (!hasData && !hasError) {
+      status = 'pending'
+    } else if (hasData && !hasError) {
+      status = 'success'
+    } else if (!hasData && hasError) {
+      status = 'error'
+    } else {
+      status = mergedErrorUpdatedAt > mergedDataUpdatedAt ? 'error' : 'success'
+    }
+
+    const dataWins = mergedDataUpdatedAt > mergedErrorUpdatedAt
+    const outcomeSource = dataWins ? dataSource : errorSource
+
+    return {
+      data: mergedData,
+      dataUpdateCount: mergedDataUpdateCount,
+      dataUpdatedAt: mergedDataUpdatedAt,
+      error: status === 'success' ? null : (mergedError as any),
+      errorUpdateCount: mergedErrorUpdateCount,
+      errorUpdatedAt: mergedErrorUpdatedAt,
+      fetchFailureCount:
+        outcomeSource.fetchFailureCount ?? inMemoryState.fetchFailureCount,
+      fetchFailureReason:
+        outcomeSource.fetchFailureReason !== undefined
+          ? outcomeSource.fetchFailureReason
+          : inMemoryState.fetchFailureReason,
+      fetchMeta:
+        outcomeSource.fetchMeta !== undefined
+          ? outcomeSource.fetchMeta
+          : inMemoryState.fetchMeta,
+      isInvalidated:
+        outcomeSource.isInvalidated ?? inMemoryState.isInvalidated,
+      status,
+      fetchStatus: 'idle',
+    }
+  }
+
   async function restoreQueries(
     queryClient: QueryClient,
     filters: Pick<QueryFilters, 'queryKey' | 'exact'> = {},
@@ -303,13 +389,26 @@ export function experimental_createQueryPersister<TStorageValue = string>({
             }
           }
 
-          queryClient.setQueryData(
-            persistedQuery.queryKey,
-            persistedQuery.state.data,
-            {
-              updatedAt: persistedQuery.state.dataUpdatedAt,
-            },
-          )
+          const queryCache = queryClient.getQueryCache()
+          const existingQuery = queryCache.get(persistedQuery.queryHash)
+          if (existingQuery) {
+            const merged = mergeRestoredState(
+              persistedQuery.state,
+              existingQuery.state as QueryState,
+            )
+            if (merged) {
+              existingQuery.setState(merged as any)
+            }
+          } else {
+            const query = queryCache.build(queryClient, {
+              queryKey: persistedQuery.queryKey,
+              queryHash: persistedQuery.queryHash,
+            })
+            query.setState({
+              ...persistedQuery.state,
+              fetchStatus: 'idle',
+            } as any)
+          }
         }
       }
     } else if (process.env.NODE_ENV === 'development') {
